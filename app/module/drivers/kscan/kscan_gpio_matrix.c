@@ -75,6 +75,8 @@ struct kscan_matrix_data {
 #if USE_INTERRUPTS
     /** Array of length config->inputs.len */
     struct kscan_matrix_irq_callback *irqs;
+    /** Set from ISR; work drops all outputs (SPI 595 cannot run in ISR). */
+    bool quiesce_outputs;
 #endif
     /** Timestamp of the current or scheduled scan. */
     int64_t scan_time;
@@ -182,10 +184,11 @@ static void kscan_matrix_irq_callback_handler(const struct device *port, struct 
         CONTAINER_OF(cb, struct kscan_matrix_irq_callback, callback);
     struct kscan_matrix_data *data = irq_data->dev->data;
 
-    // Disable our interrupts temporarily to avoid re-entry while we scan.
-    kscan_matrix_interrupt_disable(data->dev);
-
-    data->scan_time = k_uptime_get();
+// Disable IRQs only. Do not drive outputs here: gpio-595 SPI returns
+// -EWOULDBLOCK in ISR and would leave columns stuck high (ZMK #2945).
+kscan_matrix_interrupt_configure(data->dev, GPIO_INT_DISABLE);
+data->quiesce_outputs = true;
+data->scan_time = k_uptime_get();
 
     k_work_reschedule(&data->work, K_NO_WAIT);
 }
@@ -294,6 +297,13 @@ static void kscan_matrix_work_handler(struct k_work *work) {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
     struct kscan_matrix_data *data = CONTAINER_OF(dwork, struct kscan_matrix_data, work);
     kscan_matrix_read(data->dev);
+
+ #if USE_INTERRUPTS
+    if (data->quiesce_outputs) {
+        data->quiesce_outputs = false;
+        kscan_matrix_set_all_outputs(data->dev, 0);
+    }
+#endif
 }
 
 static int kscan_matrix_configure(const struct device *dev, const kscan_callback_t callback) {
